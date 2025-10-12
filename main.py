@@ -16,20 +16,21 @@ import os
 
 
 class PLCThread(Thread):
-    def __init__(self, plc_details, queue, reload=False, signal_based=False, csv_enabled=False):
+    def __init__(self, plc_details, queue, reload=False, signal_based=False, csv_enabled=False, sleep_interval=0.01):
         #initialize the thread
         Thread.__init__(self)
         self.name = plc_details['plc_name']
         self.plc_ip = plc_details['plc_ip']
         self.opcua_url = plc_details['opcua_url']
         self.address_mappings = plc_details['address_mappings']
-        # special opcua running tag 
+        # special opcua running tag
         self.plc_running_tag=None
-        
+
         self.queue = queue
         self.reload = reload
         self.signal_based = signal_based
         self.csv_enabled = csv_enabled
+        self.sleep_interval = plc_details.get('sleep_interval', sleep_interval)  # Use config value or default
         self.update_requested = Event()
         #derieved variables
         self.logger = logging.getLogger(self.name)
@@ -335,7 +336,7 @@ class PLCThread(Thread):
                 #     break
                 
                 # Add a small sleep to reduce CPU usage
-                time.sleep(0.05)
+                time.sleep(self.sleep_interval)
         
         # Step 5: close the connections
         try:
