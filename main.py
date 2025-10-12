@@ -16,7 +16,7 @@ import os
 
 
 class PLCThread(Thread):
-    def __init__(self, plc_details, queue, reload=False, signal_based=False, csv_enabled=False, sleep_interval=0.01):
+    def __init__(self, plc_details, queue, reload=False, csv_enabled=False, sleep_interval=0.01):
         #initialize the thread
         Thread.__init__(self)
         self.name = plc_details['plc_name']
@@ -28,10 +28,8 @@ class PLCThread(Thread):
 
         self.queue = queue
         self.reload = reload
-        self.signal_based = signal_based
         self.csv_enabled = csv_enabled
         self.sleep_interval = plc_details.get('sleep_interval', sleep_interval)  # Use config value or default
-        self.update_requested = Event()
         #derieved variables
         self.logger = logging.getLogger(self.name)
         self.logger.setLevel(logging.INFO)
@@ -119,74 +117,253 @@ class PLCThread(Thread):
     def stopped(self):
         return self._stop_event.is_set()
     
+    def _group_consecutive_addresses(self, mappings):
+        """Group consecutive addresses of the same data_type for batch reading."""
+        groups = []
+        current_group = []
+
+        for mapping in mappings:
+            plc_address = mapping['plc_reg_add']
+            data_type = mapping.get('data_type', 'int16').upper()
+
+            # Skip HEARTBEAT
+            if plc_address == "HEARTBEAT":
+                continue
+
+            # Normalize data types
+            if data_type in ['BOOL', 'CHANNEL']:
+                data_type = 'INT16'
+
+            # Try to extract base address and number
+            match = re.match(r'^([A-Z]+)(\d+)$', plc_address)
+            if not match:
+                # Non-consecutive address, start new group
+                if current_group:
+                    groups.append(current_group)
+                current_group = [mapping]
+                continue
+
+            base, num_str = match.groups()
+            try:
+                num = int(num_str)
+            except ValueError:
+                # Invalid number, treat as non-consecutive
+                if current_group:
+                    groups.append(current_group)
+                current_group = [mapping]
+                continue
+
+            # Check if can extend current group
+            if current_group:
+                last_mapping = current_group[-1]
+                last_addr = last_mapping['plc_reg_add']
+                last_match = re.match(r'^([A-Z]+)(\d+)$', last_addr)
+                if last_match:
+                    last_base, last_num_str = last_match.groups()
+                    try:
+                        last_num = int(last_num_str)
+                        last_data_type = last_mapping.get('data_type', 'int16').upper()
+                        if last_data_type in ['BOOL', 'CHANNEL']:
+                            last_data_type = 'INT16'
+
+                        # Same base, consecutive numbers, same data type
+                        if (base == last_base and
+                            num == last_num + 1 and
+                            data_type == last_data_type):
+                            current_group.append(mapping)
+                            continue
+                    except ValueError:
+                        pass
+
+            # Start new group
+            if current_group:
+                groups.append(current_group)
+            current_group = [mapping]
+
+        if current_group:
+            groups.append(current_group)
+
+        return groups
+
+    def _batch_individual_addresses(self, mappings, batch_size=10):
+        """Batch individual addresses into groups for multiple_read."""
+        batches = []
+        for i in range(0, len(mappings), batch_size):
+            batch = mappings[i:i + batch_size]
+            batches.append(batch)
+        return batches
+
     def _perform_plc_update_cycle(self, fins, opcua_manager):
-        """Perform one cycle of reading from PLC and writing to OPC UA"""
+        """Perform one cycle of reading from PLC and writing to OPC UA with optimized batch reading."""
         row_data = [datetime.now().strftime("%Y-%m-%d %H:%M:%S")]  # Timestamp
         plc_cycle_ok = False  # Track if at least one PLC read was successful
         plc_values = {}  # Store values by opcua_tag to maintain order
-        
-        # PASS 1: Read all PLC registers (skip HEARTBEAT for now)
-        for mapping in self.address_mappings:
-            plc_address = mapping['plc_reg_add']
-            opcua_tag = mapping['opcua_reg_add']
-            data_type = mapping.get('data_type', 'int16') # Default to int16 if not specified
-            bool_temp = False
-            
-            # Skip HEARTBEAT during read phase - we'll handle it in Pass 2
-            if plc_address == "HEARTBEAT":
-                plc_values[opcua_tag] = None  # Placeholder, will be calculated later
-                continue
-            
-            if data_type == 'bool':
-                bool_temp = True
 
-            if data_type in ['bool','channel']:
-                data_type = 'int16'
-            
-            try:
-                # Read from PLC
-                pack_value = fins.read(plc_address, data_type=data_type)
-                unpack_value = pack_value['data'][0]
-                
-                # sometimes the value can be none    
-                if unpack_value is not None:
-                    plc_cycle_ok = True  # ✅ at least one PLC read succeeded
-                    if bool_temp:
-                        plc_value = bool(unpack_value)
+        # Separate HEARTBEAT from other mappings
+        regular_mappings = [m for m in self.address_mappings if m['plc_reg_add'] != "HEARTBEAT"]
+        heartbeat_mapping = next((m for m in self.address_mappings if m['plc_reg_add'] == "HEARTBEAT"), None)
+
+        # Group consecutive addresses for batch reading
+        consecutive_groups = self._group_consecutive_addresses(regular_mappings)
+
+        # Process consecutive groups with batch_read
+        for group in consecutive_groups:
+            if len(group) == 1:
+                # Single address - use individual read
+                mapping = group[0]
+                plc_address = mapping['plc_reg_add']
+                opcua_tag = mapping['opcua_reg_add']
+                data_type = mapping.get('data_type', 'int16')
+                bool_temp = False
+
+                if data_type == 'bool':
+                    bool_temp = True
+
+                if data_type in ['bool','channel']:
+                    data_type = 'int16'
+
+                try:
+                    pack_value = fins.read(plc_address, data_type=data_type)
+                    unpack_value = pack_value['data'][0]
+
+                    if unpack_value is not None:
+                        plc_cycle_ok = True
+                        if bool_temp:
+                            plc_value = bool(unpack_value)
+                        else:
+                            plc_value = unpack_value
                     else:
-                        plc_value = unpack_value
-                else:
+                        plc_value = None
+
+                except Exception as e:
                     plc_value = None
-                    
-            except Exception as e:
-                # in the continuous reading any missed data reason is logged
-                plc_value = None
-                self.failed_to_read += 1 
-                self.logger.error(f"Missed reading {self.failed_to_read},\n Error reading PLC {self.name} address {plc_address}: \n{e}")
-                # for the immidiate stop it is written here after theshold after the cycle you put it in th csv 
-                if self.failed_to_read > self.threshold:
-                    self.logger.error(f"Too many errors encountered: {self.failed_to_read} reads the threshold met {self.threshold}. Closing thread.")
-                    self.queue.put(f"{self.name}-too many errors")
-                    self.stop()
-                    return  # Exit the method early
-                
-            # Store the value for Pass 2
-            plc_values[opcua_tag] = plc_value
+                    self.failed_to_read += 1
+                    self.logger.error(f"Missed reading {self.failed_to_read},\n Error reading PLC {self.name} address {plc_address}: \n{e}")
+                    if self.failed_to_read > self.threshold:
+                        self.logger.error(f"Too many errors encountered: {self.failed_to_read} reads the threshold met {self.threshold}. Closing thread.")
+                        self.queue.put(f"{self.name}-too many errors")
+                        self.stop()
+                        return
+
+                plc_values[opcua_tag] = plc_value
+
+            else:
+                # Consecutive group - use batch_read
+                first_mapping = group[0]
+                plc_address = first_mapping['plc_reg_add']
+                data_type = first_mapping.get('data_type', 'int16').upper()
+                if data_type in ['BOOL', 'CHANNEL']:
+                    data_type = 'INT16'
+
+                try:
+                    batch_result = fins.batch_read(plc_address, data_type=data_type, no_items_to_read=len(group))
+
+                    if batch_result['status'] == 'success':
+                        plc_cycle_ok = True
+                        for i, mapping in enumerate(group):
+                            opcua_tag = mapping['opcua_reg_add']
+                            data_type_orig = mapping.get('data_type', 'int16')
+                            bool_temp = data_type_orig == 'bool'
+
+                            unpack_value = batch_result['data'][i] if i < len(batch_result['data']) else None
+
+                            if unpack_value is not None:
+                                if bool_temp:
+                                    plc_value = bool(unpack_value)
+                                else:
+                                    plc_value = unpack_value
+                            else:
+                                plc_value = None
+
+                            plc_values[opcua_tag] = plc_value
+                    else:
+                        # Batch read failed, fall back to individual reads
+                        self.logger.warning(f"Batch read failed for group starting at {plc_address}, falling back to individual reads")
+                        for mapping in group:
+                            plc_address_ind = mapping['plc_reg_add']
+                            opcua_tag = mapping['opcua_reg_add']
+                            data_type_ind = mapping.get('data_type', 'int16')
+                            bool_temp = data_type_ind == 'bool'
+
+                            if data_type_ind in ['bool','channel']:
+                                data_type_ind = 'int16'
+
+                            try:
+                                pack_value = fins.read(plc_address_ind, data_type=data_type_ind)
+                                unpack_value = pack_value['data'][0]
+
+                                if unpack_value is not None:
+                                    plc_cycle_ok = True
+                                    if bool_temp:
+                                        plc_value = bool(unpack_value)
+                                    else:
+                                        plc_value = unpack_value
+                                else:
+                                    plc_value = None
+
+                            except Exception as e:
+                                plc_value = None
+                                self.failed_to_read += 1
+                                self.logger.error(f"Missed reading {self.failed_to_read},\n Error reading PLC {self.name} address {plc_address_ind}: \n{e}")
+                                if self.failed_to_read > self.threshold:
+                                    self.logger.error(f"Too many errors encountered: {self.failed_to_read} reads the threshold met {self.threshold}. Closing thread.")
+                                    self.queue.put(f"{self.name}-too many errors")
+                                    self.stop()
+                                    return
+
+                            plc_values[opcua_tag] = plc_value
+
+                except Exception as e:
+                    # Batch read exception, fall back to individual reads
+                    self.logger.warning(f"Batch read exception for group starting at {plc_address}: {e}, falling back to individual reads")
+                    for mapping in group:
+                        plc_address_ind = mapping['plc_reg_add']
+                        opcua_tag = mapping['opcua_reg_add']
+                        data_type_ind = mapping.get('data_type', 'int16')
+                        bool_temp = data_type_ind == 'bool'
+
+                        if data_type_ind in ['bool','channel']:
+                            data_type_ind = 'int16'
+
+                        try:
+                            pack_value = fins.read(plc_address_ind, data_type=data_type_ind)
+                            unpack_value = pack_value['data'][0]
+
+                            if unpack_value is not None:
+                                plc_cycle_ok = True
+                                if bool_temp:
+                                    plc_value = bool(unpack_value)
+                                else:
+                                    plc_value = unpack_value
+                            else:
+                                plc_value = None
+
+                        except Exception as e2:
+                            plc_value = None
+                            self.failed_to_read += 1
+                            self.logger.error(f"Missed reading {self.failed_to_read},\n Error reading PLC {self.name} address {plc_address_ind}: \n{e2}")
+                            if self.failed_to_read > self.threshold:
+                                self.logger.error(f"Too many errors encountered: {self.failed_to_read} reads the threshold met {self.threshold}. Closing thread.")
+                                self.queue.put(f"{self.name}-too many errors")
+                                self.stop()
+                                return
+
+                        plc_values[opcua_tag] = plc_value
         
         # PASS 2: Write to CSV and OPC UA in original mapping order
         for mapping in self.address_mappings:
             plc_address = mapping['plc_reg_add']
             opcua_tag = mapping['opcua_reg_add']
-            
+
             # Handle HEARTBEAT with correct plc_cycle_ok value
             if plc_address == "HEARTBEAT":
                 plc_value = plc_cycle_ok  # Now correctly reflects if any PLC read succeeded
             else:
-                plc_value = plc_values[opcua_tag]
-            
+                plc_value = plc_values.get(opcua_tag, None)
+
             # Append the value to the row data (maintains column order!)
             row_data.append(str(plc_value) if plc_value is not None else 'NaN')
-            
+
             # Writing to the OPCUA server (only if connected and manager is available)
             if self.opcua_connected and opcua_manager is not None:
                 try:
@@ -199,18 +376,13 @@ class PLCThread(Thread):
                     self.logger.error(f"Missed Pushing {self.failed_to_push},\n Error pushing value to OPCUA server {opcua_tag}: {e}")
                     self.logger.warning("OPC UA connection lost - switching to CSV fallback mode")
                     continue
-                
+
         # Write to CSV file if enabled or if OPC UA is down
         if self.csv_enabled or not self.opcua_connected:
             self._ensure_csv_file()
             if self.csv_writer and self.csv_file:
                 self.csv_writer.writerow(row_data)
                 self.csv_file.flush()
-    
-    def request_update(self):
-        """Request an update cycle (for signal-based mode)"""
-        self.update_requested.set()
-    
     
     def run(self):
         # Header for the connection status check
@@ -307,36 +479,21 @@ class PLCThread(Thread):
             
     
         # Step4: two tasks {get the variable values from the PLC , push value to OPC UA}
-        if self.signal_based:
-            self.logger.info(f"PLC {self.name} running in signal-based mode - waiting for update signals")
-            print(f"    ✅ PLC {self.name} running in signal-based mode")
+        self.logger.info(f"PLC {self.name} running in continuous mode")
+        print(f"    ✅ PLC {self.name} running in continuous mode")
+        
+        while not self.stopped():
+            self._perform_plc_update_cycle(fins, opcua_manager)
             
-            while not self.stopped():
-                try:
-                    # Wait for update signal or check every second for shutdown
-                    if self.update_requested.wait(timeout=1.0):
-                        # Update signal received - perform one read/write cycle
-                        self._perform_plc_update_cycle(fins, opcua_manager)
-                        self.update_requested.clear()
-                except Exception as e:
-                    self.logger.error(f"Error in signal-based loop: {e}")
-                    time.sleep(5)  # Brief pause before retrying
-        else:
-            self.logger.info(f"PLC {self.name} running in continuous mode")
-            print(f"    ✅ PLC {self.name} running in continuous mode")
+            ## This is actually the stopping the program as per the threshold limit of the errors but it i sin the wrong place
+            # if self.failed_to_read > self.threshold or self.failed_to_push > self.threshold:
+            #     self.logger.error(f"Too many errors encountered: {self.failed_to_read} reads and {self.failed_to_push} writes failed. Closing thread.")
+            #     self.queue.put(f"{self.name}-too many errors")
+            #     self.stop()
+            #     break
             
-            while not self.stopped():
-                self._perform_plc_update_cycle(fins, opcua_manager)
-                
-                ## This is actually the stopping the program as per the threshold limit of the errors but it i sin the wrong place 
-                # if self.failed_to_read > self.threshold or self.failed_to_push > self.threshold:
-                #     self.logger.error(f"Too many errors encountered: {self.failed_to_read} reads and {self.failed_to_push} writes failed. Closing thread.")
-                #     self.queue.put(f"{self.name}-too many errors")
-                #     self.stop()
-                #     break
-                
-                # Add a small sleep to reduce CPU usage
-                time.sleep(self.sleep_interval)
+            # Add a small sleep to reduce CPU usage
+            time.sleep(self.sleep_interval)
         
         # Step 5: close the connections
         try:
@@ -401,12 +558,12 @@ def process_queue(queue, threads):
                 break
         queue.task_done()
 
-def create_threads(plc_details, reload:bool = False, signal_based:bool = False, csv_enabled:bool = False):
+def create_threads(plc_details, reload:bool = False, csv_enabled:bool = False):
     threads = []
     queue = Queue()
     for plc in plc_details['plcs']:
-        thread = PLCThread(plc, queue, reload=reload, signal_based=signal_based, csv_enabled=csv_enabled)
-        threads.append(thread) 
+        thread = PLCThread(plc, queue, reload=reload, csv_enabled=csv_enabled)
+        threads.append(thread)
         thread.start()
 
     # one more thread to process the queue
@@ -414,15 +571,15 @@ def create_threads(plc_details, reload:bool = False, signal_based:bool = False, 
     queue_thread.daemon = True  # Make it a daemon thread
     queue_thread.start()
     
-    return threads  # Return threads for signal-based control
+    return threads
     
-def main(reload:bool = False, signal_based:bool = False, config_file:str = 'plc_data.json', csv_enabled:bool = False):
+def main(reload:bool = False, config_file:str = 'plc_data.json', csv_enabled:bool = False):
     # Setting up the initials
     
     # 1. Custom logging configuration
     logging.config.fileConfig('logging.conf')
     
-    # 2. Load the PLC json file  
+    # 2. Load the PLC json file
     try:
         plc_details = load_config(config_file)
         logging.info(f"Loaded PLC details from {config_file}")
@@ -434,18 +591,10 @@ def main(reload:bool = False, signal_based:bool = False, config_file:str = 'plc_
         logging.info(f"Error data or no data in the {config_file}")
         return
     
-    # 3. Create the threads 
-    threads = create_threads(plc_details, reload=reload, signal_based=signal_based, csv_enabled=csv_enabled)
+    # 3. Create the threads
+    threads = create_threads(plc_details, reload=reload, csv_enabled=csv_enabled)
     
-    if signal_based:
-        logging.info("System running in signal-based mode. Use request_update() method to trigger updates.")
-        print("\n🔔 SIGNAL-BASED MODE ACTIVE")
-        print("   To trigger updates, you can:")
-        print("   1. Send SIGUSR1 signal to the node manager process")
-        print("   2. Call request_update() method on PLC threads")
-        print("   3. Use external trigger mechanisms")
-    
-    return threads  # Return threads for external control
+    return threads
     
 
 if __name__ == "__main__":
@@ -455,11 +604,6 @@ if __name__ == "__main__":
         "--reload",
         action="store_true",
         help="Enable reload mode for OpcuaAutoNodeMapper"
-        )
-    parser.add_argument(
-        "--signal-based",
-        action="store_true",
-        help="Enable signal-based mode (updates only on signal)"
         )
     parser.add_argument(
         "--config",
@@ -475,6 +619,6 @@ if __name__ == "__main__":
         )
     args = parser.parse_args()
     try:
-        main(reload=args.reload, signal_based=args.signal_based, config_file=args.config, csv_enabled=args.csv)
+        main(reload=args.reload, config_file=args.config, csv_enabled=args.csv)
     except KeyboardInterrupt:
         logging.info("Program terminated by user")
