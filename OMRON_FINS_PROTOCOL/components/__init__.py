@@ -17,6 +17,11 @@ from .conversion import (
     bcd_to_decimal2,
 )
 
+from .data_type_mapping import (
+    return_raw_bytes,
+    DATA_TYPE_MAPPING,
+)
+
 __all__ = [
     "toBin",
     "WordToBin",
@@ -34,4 +39,6 @@ __all__ = [
     "toString",
     "bcd_to_decimal",
     "bcd_to_decimal2",
+    "return_raw_bytes",
+    "DATA_TYPE_MAPPING",
 ]

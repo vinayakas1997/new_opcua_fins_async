@@ -1,24 +1,23 @@
 from OMRON_FINS_PROTOCOL.Infrastructure.udp_connection import FinsUdpConnection
 from OMRON_FINS_PROTOCOL.exception import *
+from OMRON_FINS_PROTOCOL.components.data_type_mapping import DATA_TYPE_MAPPING
 from opcua import Client
 import logging
 import logging.config
 import json
-# from opcua_json import OpcuaAutoNodeMapper
-from threading import Thread, Event 
-from queue import Queue, Empty
+from opcua_json import OpcuaAutoNodeMapper
+import asyncio
+from asyncio import Event as AsyncEvent
 import re
 import csv
-import time
-from datetime import datetime 
+from datetime import datetime
 import os
-# from signal_manager import register_update_callback, start_signal_monitoring, stop_signal_monitoring
+import signal
 
 
-class PLCThread(Thread):
+class PLCTask:
     def __init__(self, plc_details, queue, reload=False, csv_enabled=False, sleep_interval=0.01):
-        #initialize the thread
-        Thread.__init__(self)
+        #initialize the async task
         self.name = plc_details['plc_name']
         self.plc_ip = plc_details['plc_ip']
         self.opcua_url = plc_details['opcua_url']
@@ -45,7 +44,7 @@ class PLCThread(Thread):
         # Use shared JSON file from the OPC UA node manager container
         self.opcua_json_file_name = "opcua_json_files/nodes.json"
 
-        # missing counts 
+        # missing counts
         self.threshold = 3
         self.failed_to_read= 0
         self.failed_to_push= 0
@@ -84,14 +83,18 @@ class PLCThread(Thread):
         else:
             self.logger.info(f"CSV mode disabled - will only use CSV as fallback when OPC UA is down")
         
-        self._stop_event = Event()
+        self._stop_event = AsyncEvent()
         
+        # Initialize optimized address grouping (done once, not every cycle)
+        self.multiple_read_groups = []  # Groups of 20 for 1-word data types
+        self.single_read_addresses = []  # Individual addresses for multi-word data types
+        self._initialize_address_groups()
         
-        # storing the thraed status
-        self.logger.info(f"Initializing PLCThread(Program initialised) for {self.name} with IP {self.plc_ip} and OPC UA URL {self.opcua_url}")
+        # storing the task status
+        self.logger.info(f"Initializing PLCTask(Program initialised) for {self.name} with IP {self.plc_ip} and OPC UA URL {self.opcua_url}")
         print("\n\n -----------------:::::::::::::::::::::::::-----------------")
         print("   **** PLC INFO ****")
-        print(f"    PLC_Name - {self.name}")    
+        print(f"    PLC_Name - {self.name}")
         print(f"    PLC_IP - {self.plc_ip}")
         print(f"    OPC UA Server {self.opcua_url}")
         #print date and time
@@ -111,89 +114,98 @@ class PLCThread(Thread):
         if self.csv_file is None:
             self._initialize_csv_file()
     
-    # add stop and stopped methods to control the thread
+    async def _ensure_csv_file_async(self):
+        """Ensure CSV file is available for fallback storage (async version)"""
+        if self.csv_file is None:
+            await self._initialize_csv_file_async()
+    
+    async def _initialize_csv_file_async(self):
+        """Initialize CSV file and writer asynchronously"""
+        if self.csv_file is None:
+            # For now, we'll use synchronous file operations as they're typically fast
+            # In a future enhancement, we could use aiofiles for true async file I/O
+            self.csv_file = open(self.csv_filename, 'w', newline='')
+            self.csv_writer = csv.writer(self.csv_file)
+            self.csv_writer.writerow(self.csv_header)
+            self.logger.info(f"CSV file initialized: {self.csv_filename}")
+    
+    # add stop and stopped methods to control the async task
     def stop(self):
         self._stop_event.set()
     def stopped(self):
         return self._stop_event.is_set()
     
-    def _group_consecutive_addresses(self, mappings):
-        """Group consecutive addresses of the same data_type for batch reading."""
-        groups = []
-        current_group = []
-
-        for mapping in mappings:
+    def _initialize_address_groups(self):
+        """Initialize address groups once at startup - optimized for performance."""
+        self.multiple_read_groups = []
+        self.single_read_addresses = []
+        
+        # Filter out HEARTBEAT and separate by word size
+        one_word_mappings = []
+        multi_word_mappings = []
+        
+        for mapping in self.address_mappings:
             plc_address = mapping['plc_reg_add']
-            data_type = mapping.get('data_type', 'int16').upper()
-
-            # Skip HEARTBEAT
+            
+            # Skip HEARTBEAT - handled separately
             if plc_address == "HEARTBEAT":
                 continue
-
+                
+            data_type = mapping.get('data_type', 'int16').upper()
+            
             # Normalize data types
             if data_type in ['BOOL', 'CHANNEL']:
                 data_type = 'INT16'
+            
+            # Check if data type exists in mapping and get word size
+            if data_type in DATA_TYPE_MAPPING:
+                words_per_item, _ = DATA_TYPE_MAPPING[data_type]
+                
+                if words_per_item == 1:
+                    # 1-word data type - add to multiple read groups
+                    one_word_mappings.append({
+                        'plc_reg': plc_address,
+                        'opcua_reg': mapping['opcua_reg_add'],
+                        'data_type': data_type,
+                        'original_mapping': mapping
+                    })
+                else:
+                    # Multi-word data type - add to single read list
+                    multi_word_mappings.append({
+                        'plc_reg': plc_address,
+                        'opcua_reg': mapping['opcua_reg_add'],
+                        'data_type': data_type,
+                        'original_mapping': mapping
+                    })
+            else:
+                self.logger.warning(f"Unknown data type '{data_type}' for address {plc_address}, treating as single read")
+                multi_word_mappings.append({
+                    'plc_reg': plc_address,
+                    'opcua_reg': mapping['opcua_reg_add'],
+                    'data_type': data_type,
+                    'original_mapping': mapping
+                })
+        
+        # Group 1-word addresses in batches of 20 for multiple_read
+        batch_size = 20
+        for i in range(0, len(one_word_mappings), batch_size):
+            batch = one_word_mappings[i:i + batch_size]
+            self.multiple_read_groups.append(batch)
+        
+        # Store multi-word addresses for individual reads
+        self.single_read_addresses = multi_word_mappings
+        
+        self.logger.info(f"Address grouping initialized:")
+        self.logger.info(f"  - Multiple read groups: {len(self.multiple_read_groups)} (max 20 addresses each)")
+        self.logger.info(f"  - Single read addresses: {len(self.single_read_addresses)}")
+        
+    def _hex_bytes_to_string(self, data: bytes) -> str:
+        """Convert bytes to HEX string format (0x8080 -> '8080')."""
+        if not data:
+            return ""
+        return data.hex().upper()
 
-            # Try to extract base address and number
-            match = re.match(r'^([A-Z]+)(\d+)$', plc_address)
-            if not match:
-                # Non-consecutive address, start new group
-                if current_group:
-                    groups.append(current_group)
-                current_group = [mapping]
-                continue
-
-            base, num_str = match.groups()
-            try:
-                num = int(num_str)
-            except ValueError:
-                # Invalid number, treat as non-consecutive
-                if current_group:
-                    groups.append(current_group)
-                current_group = [mapping]
-                continue
-
-            # Check if can extend current group
-            if current_group:
-                last_mapping = current_group[-1]
-                last_addr = last_mapping['plc_reg_add']
-                last_match = re.match(r'^([A-Z]+)(\d+)$', last_addr)
-                if last_match:
-                    last_base, last_num_str = last_match.groups()
-                    try:
-                        last_num = int(last_num_str)
-                        last_data_type = last_mapping.get('data_type', 'int16').upper()
-                        if last_data_type in ['BOOL', 'CHANNEL']:
-                            last_data_type = 'INT16'
-
-                        # Same base, consecutive numbers, same data type
-                        if (base == last_base and
-                            num == last_num + 1 and
-                            data_type == last_data_type):
-                            current_group.append(mapping)
-                            continue
-                    except ValueError:
-                        pass
-
-            # Start new group
-            if current_group:
-                groups.append(current_group)
-            current_group = [mapping]
-
-        if current_group:
-            groups.append(current_group)
-
-        return groups
-
-    def _batch_individual_addresses(self, mappings, batch_size=10):
-        """Batch individual addresses into groups for multiple_read."""
-        batches = []
-        for i in range(0, len(mappings), batch_size):
-            batch = mappings[i:i + batch_size]
-            batches.append(batch)
-        return batches
-
-    def _perform_plc_update_cycle(self, fins, opcua_manager):
+    async def _perform_plc_update_cycle(self, fins, opcua_manager):
         """Perform one cycle of reading from PLC and writing to OPC UA with optimized batch reading."""
         row_data = [datetime.now().strftime("%Y-%m-%d %H:%M:%S")]  # Timestamp
         plc_cycle_ok = False  # Track if at least one PLC read was successful
@@ -223,7 +235,7 @@ class PLCThread(Thread):
                     data_type = 'int16'
 
                 try:
-                    pack_value = fins.read(plc_address, data_type=data_type)
+                    pack_value = await fins.read(plc_address, data_type=data_type)
                     unpack_value = pack_value['data'][0]
 
                     if unpack_value is not None:
@@ -240,8 +252,8 @@ class PLCThread(Thread):
                     self.failed_to_read += 1
                     self.logger.error(f"Missed reading {self.failed_to_read},\n Error reading PLC {self.name} address {plc_address}: \n{e}")
                     if self.failed_to_read > self.threshold:
-                        self.logger.error(f"Too many errors encountered: {self.failed_to_read} reads the threshold met {self.threshold}. Closing thread.")
-                        self.queue.put(f"{self.name}-too many errors")
+                        self.logger.error(f"Too many errors encountered: {self.failed_to_read} reads the threshold met {self.threshold}. Closing task.")
+                        await self.queue.put(f"{self.name}-too many errors")
                         self.stop()
                         return
 
@@ -256,7 +268,7 @@ class PLCThread(Thread):
                     data_type = 'INT16'
 
                 try:
-                    batch_result = fins.batch_read(plc_address, data_type=data_type, no_items_to_read=len(group))
+                    batch_result = await fins.batch_read(plc_address, data_type=data_type, no_items_to_read=len(group))
 
                     if batch_result['status'] == 'success':
                         plc_cycle_ok = True
@@ -289,7 +301,7 @@ class PLCThread(Thread):
                                 data_type_ind = 'int16'
 
                             try:
-                                pack_value = fins.read(plc_address_ind, data_type=data_type_ind)
+                                pack_value = await fins.read(plc_address_ind, data_type=data_type_ind)
                                 unpack_value = pack_value['data'][0]
 
                                 if unpack_value is not None:
@@ -306,8 +318,8 @@ class PLCThread(Thread):
                                 self.failed_to_read += 1
                                 self.logger.error(f"Missed reading {self.failed_to_read},\n Error reading PLC {self.name} address {plc_address_ind}: \n{e}")
                                 if self.failed_to_read > self.threshold:
-                                    self.logger.error(f"Too many errors encountered: {self.failed_to_read} reads the threshold met {self.threshold}. Closing thread.")
-                                    self.queue.put(f"{self.name}-too many errors")
+                                    self.logger.error(f"Too many errors encountered: {self.failed_to_read} reads the threshold met {self.threshold}. Closing task.")
+                                    await self.queue.put(f"{self.name}-too many errors")
                                     self.stop()
                                     return
 
@@ -326,7 +338,7 @@ class PLCThread(Thread):
                             data_type_ind = 'int16'
 
                         try:
-                            pack_value = fins.read(plc_address_ind, data_type=data_type_ind)
+                            pack_value = await fins.read(plc_address_ind, data_type=data_type_ind)
                             unpack_value = pack_value['data'][0]
 
                             if unpack_value is not None:
@@ -343,8 +355,8 @@ class PLCThread(Thread):
                             self.failed_to_read += 1
                             self.logger.error(f"Missed reading {self.failed_to_read},\n Error reading PLC {self.name} address {plc_address_ind}: \n{e2}")
                             if self.failed_to_read > self.threshold:
-                                self.logger.error(f"Too many errors encountered: {self.failed_to_read} reads the threshold met {self.threshold}. Closing thread.")
-                                self.queue.put(f"{self.name}-too many errors")
+                                self.logger.error(f"Too many errors encountered: {self.failed_to_read} reads the threshold met {self.threshold}. Closing task.")
+                                await self.queue.put(f"{self.name}-too many errors")
                                 self.stop()
                                 return
 
@@ -379,26 +391,28 @@ class PLCThread(Thread):
 
         # Write to CSV file if enabled or if OPC UA is down
         if self.csv_enabled or not self.opcua_connected:
-            self._ensure_csv_file()
+            await self._ensure_csv_file_async()
             if self.csv_writer and self.csv_file:
+                # For high-frequency writes, we'll use synchronous CSV writing
+                # as it's typically fast and doesn't benefit much from async
                 self.csv_writer.writerow(row_data)
                 self.csv_file.flush()
     
-    def run(self):
+    async def run(self):
         # Header for the connection status check
         print("\n")
         print("   ****Connection Status Check****")
         print("\n")
 
         # Step 1: establish the fins connection to plc
-        print("1. Fins Connection Check") 
+        print("1. Fins Connection Check")
         print("          Fetching CPU Details ..........")
         try:
             # Initialize FINS connection
             fins = FinsUdpConnection(self.plc_ip)
-            fins.connect()
+            await fins.connect()
             # As UDP is just broad casting doesn't confirm the actual connection test so lets get cpu details to confirm
-            cpu_details = fins.cpu_unit_details_read()
+            cpu_details = await fins.cpu_unit_details_read()
 
             if cpu_details["status"] == "success":
                 self.logger.info(f"Succesfully Connected to PLC {self.name} at {self.plc_ip}")
@@ -409,12 +423,12 @@ class PLCThread(Thread):
         except Exception as e:
             self.logger.error(f"Failed to connect to PLC {self.name} at {self.plc_ip}: \n{e}")
             print(f"          ❌ Unsuccessful Connection to PLC ")
-            self.queue.put(f"{self.name}-fins connection error")
-            # Also deleting the csv file 
-            # a) close the file first 
+            await self.queue.put(f"{self.name}-fins connection error")
+            # Also deleting the csv file
+            # a) close the file first
             if hasattr(self, 'csv_file') and self.csv_file:
                 self.csv_file.close()
-            # b) delete the file 
+            # b) delete the file
             if os.path.exists(self.csv_filename):
                 os.remove(self.csv_filename)
             return
@@ -440,7 +454,7 @@ class PLCThread(Thread):
                 wait_time = 0
                 while not os.path.exists(self.opcua_json_file_name) and wait_time < max_wait_time:
                     self.logger.info(f"Waiting for shared JSON file: {self.opcua_json_file_name}")
-                    time.sleep(2)
+                    await asyncio.sleep(2)
                     wait_time += 2
                 
                 if not os.path.exists(self.opcua_json_file_name):
@@ -483,21 +497,21 @@ class PLCThread(Thread):
         print(f"    ✅ PLC {self.name} running in continuous mode")
         
         while not self.stopped():
-            self._perform_plc_update_cycle(fins, opcua_manager)
+            await self._perform_plc_update_cycle(fins, opcua_manager)
             
             ## This is actually the stopping the program as per the threshold limit of the errors but it i sin the wrong place
             # if self.failed_to_read > self.threshold or self.failed_to_push > self.threshold:
-            #     self.logger.error(f"Too many errors encountered: {self.failed_to_read} reads and {self.failed_to_push} writes failed. Closing thread.")
-            #     self.queue.put(f"{self.name}-too many errors")
+            #     self.logger.error(f"Too many errors encountered: {self.failed_to_read} reads and {self.failed_to_push} writes failed. Closing task.")
+            #     await self.queue.put(f"{self.name}-too many errors")
             #     self.stop()
             #     break
             
             # Add a small sleep to reduce CPU usage
-            time.sleep(self.sleep_interval)
+            await asyncio.sleep(self.sleep_interval)
         
         # Step 5: close the connections
         try:
-            fins.disconnect()
+            await fins.disconnect()
             
             # Close CSV file if it was opened
             if self.csv_file:
@@ -505,14 +519,14 @@ class PLCThread(Thread):
 
             self.logger.info(f"Disconnected from PLC {self.name} at {self.plc_ip}")
         except Exception as e:
-            self.queue.put(f"{self.name}-fins disconnection error")
+            await self.queue.put(f"{self.name}-fins disconnection error")
             self.logger.error(f"Failed to disconnect from PLC {self.name} at {self.plc_ip}: \n{e}")
         
         try:
             client.disconnect()
             self.logger.info(f"Disconnected from OPC UA server at {self.opcua_url}")
         except Exception as e:
-            self.queue.put(f"{self.name}-opcua disconnection error")
+            await self.queue.put(f"{self.name}-opcua disconnection error")
             self.logger.error(f"Failed to disconnect from OPC UA server at {self.opcua_url}: \n{e}")
    
             
@@ -538,42 +552,47 @@ def load_config(config_file):
     except Exception as e:
         logging.error(f"Error loading configuration file: {e}")
 
-def process_queue(queue, threads):
+async def process_queue_async(queue, tasks):
     while True:
         try:
-            message = queue.get(timeout=1)  # Wait for a message
+            message = await asyncio.wait_for(queue.get(), timeout=1.0)  # Wait for a message
             print(f"[Error] message received: {message}")
             print(f"Stopping the program.........")
-        except Empty:
+            logging.info(f"Queue message received: {message}")
+            
+            # Find the task associated with the error and cancel it
+            for task in tasks[:]:  # Use slice copy to safely modify during iteration
+                if hasattr(task, 'get_name') and task.get_name() in message:
+                    logging.info(f"Cancelling task {task.get_name()}")
+                    task.cancel()
+                    tasks.remove(task)
+                    break
+            queue.task_done()
+        except asyncio.TimeoutError:
             # If the queue is empty, continue to check for new messages
             continue
-        logging.info(f"Queue message received: {message}")
-        # Find the thread associated with the error and stop it
-        for thread in threads:
-            if thread.name in message:
-                logging.info(f"Stopping thread {thread.name}")
-                thread.stop()
-                thread.join(timeout=10)  # Wait for the thread to finish
-                threads.remove(thread)
-                break
-        queue.task_done()
+        except asyncio.CancelledError:
+            # Task was cancelled, break the loop
+            break
 
-def create_threads(plc_details, reload:bool = False, csv_enabled:bool = False):
-    threads = []
-    queue = Queue()
+async def create_tasks(plc_details, reload:bool = False, csv_enabled:bool = False):
+    tasks = []
+    queue = asyncio.Queue()
+    
     for plc in plc_details['plcs']:
-        thread = PLCThread(plc, queue, reload=reload, csv_enabled=csv_enabled)
-        threads.append(thread)
-        thread.start()
+        plc_task = PLCTask(plc, queue, reload=reload, csv_enabled=csv_enabled)
+        task = asyncio.create_task(plc_task.run())
+        task.set_name(plc_task.name)  # Set task name for identification
+        tasks.append(task)
 
-    # one more thread to process the queue
-    queue_thread = Thread(target=process_queue, args=(queue, threads))
-    queue_thread.daemon = True  # Make it a daemon thread
-    queue_thread.start()
+    # Create async queue processor task
+    queue_task = asyncio.create_task(process_queue_async(queue, tasks))
+    queue_task.set_name("queue_processor")
+    tasks.append(queue_task)
     
-    return threads
+    return tasks
     
-def main(reload:bool = False, config_file:str = 'plc_data.json', csv_enabled:bool = False):
+async def main(reload:bool = False, config_file:str = 'plc_data.json', csv_enabled:bool = False):
     # Setting up the initials
     
     # 1. Custom logging configuration
@@ -591,10 +610,36 @@ def main(reload:bool = False, config_file:str = 'plc_data.json', csv_enabled:boo
         logging.info(f"Error data or no data in the {config_file}")
         return
     
-    # 3. Create the threads
-    threads = create_threads(plc_details, reload=reload, csv_enabled=csv_enabled)
+    # 3. Create the async tasks
+    tasks = await create_tasks(plc_details, reload=reload, csv_enabled=csv_enabled)
     
-    return threads
+    # 4. Setup signal handlers for graceful shutdown
+    def signal_handler():
+        logging.info("Received shutdown signal, cancelling all tasks...")
+        for task in tasks:
+            task.cancel()
+    
+    # Register signal handlers (Windows compatibility)
+    loop = asyncio.get_running_loop()
+    try:
+        # Unix-style signal handling
+        for sig in [signal.SIGTERM, signal.SIGINT]:
+            loop.add_signal_handler(sig, signal_handler)
+    except NotImplementedError:
+        # Windows doesn't support add_signal_handler
+        # We'll rely on KeyboardInterrupt handling
+        logging.info("Signal handlers not supported on this platform, using KeyboardInterrupt handling")
+    
+    try:
+        # 5. Run all tasks concurrently
+        await asyncio.gather(*tasks, return_exceptions=True)
+    except KeyboardInterrupt:
+        logging.info("Keyboard interrupt received, shutting down...")
+        signal_handler()
+        # Wait for tasks to finish
+        await asyncio.gather(*tasks, return_exceptions=True)
+    
+    logging.info("All tasks completed, exiting main function")
     
 
 if __name__ == "__main__":
@@ -618,7 +663,11 @@ if __name__ == "__main__":
         help="Enable CSV data storage alongside OPC UA (default: OPC UA only)"
         )
     args = parser.parse_args()
+    
     try:
-        main(reload=args.reload, config_file=args.config, csv_enabled=args.csv)
+        # Run the main async function
+        asyncio.run(main(reload=args.reload, config_file=args.config, csv_enabled=args.csv))
     except KeyboardInterrupt:
         logging.info("Program terminated by user")
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")

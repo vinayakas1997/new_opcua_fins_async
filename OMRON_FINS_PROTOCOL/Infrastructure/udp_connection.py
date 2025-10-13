@@ -17,7 +17,7 @@ from OMRON_FINS_PROTOCOL.Fins_domain.command_codes import FinsCommandCode
 from OMRON_FINS_PROTOCOL.Fins_domain.frames import FinsResponseFrame
 from OMRON_FINS_PROTOCOL.Fins_domain.fins_error import FinsResponseError
 from OMRON_FINS_PROTOCOL.Fins_domain.mem_address_parser import FinsAddressParser
-from OMRON_FINS_PROTOCOL.components import *
+from OMRON_FINS_PROTOCOL.components.data_type_mapping import DATA_TYPE_MAPPING
 from OMRON_FINS_PROTOCOL.exception import *
 from OMRON_FINS_PROTOCOL.exception.exception_rules import (
     FinsConnectionError,
@@ -25,9 +25,8 @@ from OMRON_FINS_PROTOCOL.exception.exception_rules import (
     FinsAddressError,
     FinsCommandError,
     FinsDataError,
-    validate_address,
     validate_connection_params,
-    validate_read_size
+    
 )
 
 __version__ = "0.2.0"
@@ -39,25 +38,6 @@ MAX_CHUNK_SIZE = 990  # Maximum words per FINS command chunk
 MAX_READ_SIZE = 65535  # Maximum total read size
 MAX_RETRIES = 3
 CONNECTION_CHECK_INTERVAL = 30  # seconds
-
-# Data type mapping with validation
-DATA_TYPE_MAPPING = {
-    'INT16': (1, toInt16),
-    'UINT16': (1, toUInt16),
-    'INT32': (2, toInt32),
-    'UINT32': (2, toUInt32),
-    'INT64': (4, toInt64),
-    'UINT64': (4, toUInt64),
-    'FLOAT': (2, toFloat),
-    'DOUBLE': (4, toDouble),
-    'BCD2DEC': (1, bcd_to_decimal),
-    'BOOL': (1, toInt16),
-    'CHANNEL': (1, WordToHex),
-    'WORD': (1, WordToHex),
-    'UDINT': (2, WordToHex32),
-    'BIN': (1, toBin),
-    'BITS': (1, WordToBin),
-}
 
 
 class FinsUdpConnection(FinsConnection):
@@ -595,9 +575,7 @@ class FinsUdpConnection(FinsConnection):
             FinsDataError: If data type or read size is invalid
             FinsConnectionError: If communication fails
         """
-        # Validate inputs
-        validate_address(memory_area_code)
-        validate_read_size(no_items_to_read)
+
 
         # Validate data type and get conversion info
         words_per_item, conversion_function = self._validate_data_type(data_type)
@@ -767,7 +745,7 @@ class FinsUdpConnection(FinsConnection):
                 data_part += b'\x00'  # No bit number for word addresses
 
         # Build FINS command frame
-        command_frame = self.fins_command_frame(command_code=command_code, service_id=sid, data=data_part)
+        command_frame = self.fins_command_frame(command_code=command_code, service_id=sid, text=data_part)
         final_result["debug"]["command_frame"] = str(command_frame)
 
         if self.debug:
