@@ -85,6 +85,9 @@ class PLCTask:
         
         self._stop_event = AsyncEvent()
         
+        # Background task tracking for parallel writing operations
+        self.background_tasks = set()
+        
         # Initialize optimized address grouping (done once, not every cycle)
         self.multiple_read_groups = []  # Groups of 20 for 1-word data types
         self.single_read_addresses = []  # Individual addresses for multi-word data types
@@ -135,6 +138,14 @@ class PLCTask:
     def stopped(self):
         return self._stop_event.is_set()
     
+    # to update the plc_value and with current timestamp
+    def _update_plc_value(self,plc_value):
+        #time format HH:MM:SS:MS
+        now = datetime.now()
+        current_time = now.strftime("%H:%M:%S") + ":" + now.strftime("%f")[:-3]
+        return plc_value + "&&" + current_time
+    
+    
     def _initialize_address_groups(self):
         """Initialize address groups once at startup - optimized for performance."""
         self.multiple_read_groups = []
@@ -153,8 +164,8 @@ class PLCTask:
                 
             data_type = mapping.get('data_type', 'int16').upper()
             
-            # Normalize data types
-            if data_type in ['BOOL', 'CHANNEL']:
+            # Normalize data type bool to fetch the entire word
+            if data_type == 'BOOL':
                 data_type = 'INT16'
             
             # Check if data type exists in mapping and get word size
@@ -205,198 +216,274 @@ class PLCTask:
             return ""
         return data.hex().upper()
 
+    def _extract_bit_value_from_hex(self, hex_string: str, bit_number: int) -> int:
+        """
+        Extract specific bit value from HEX string and return 1 or 0.
+        
+        Args:
+            hex_string: HEX string from PLC (e.g., "8080")
+            bit_number: Bit position (0-15 for a 16-bit word)
+        
+        Returns:
+            1 if bit is set, 0 if bit is clear
+        """
+        try:
+            if not hex_string or len(hex_string) < 4:
+                return 0
+                
+            # Convert HEX string to integer (assuming 16-bit word)
+            word_value = int(hex_string[:4], 16)  # Take first 4 hex chars (16 bits)
+            
+            # Extract specific bit (bit 0 = LSB, bit 15 = MSB)
+            bit_value = (word_value >> bit_number) & 1
+            
+            # self.logger.debug(f"Boolean extraction: HEX:{hex_string} -> Word:{word_value:016b} -> Bit {bit_number}: {bit_value}")
+            return bit_value
+            
+        except (ValueError, IndexError) as e:
+            # self.logger.error(f"Error extracting bit {bit_number} from HEX '{hex_string}': {e}")
+            return 0
+
+    def _get_bit_number_from_address(self, plc_address: str) -> int:
+        """
+        Extract bit number from PLC address like "142.01".
+        
+        Args:
+            plc_address: PLC address string
+            
+        Returns:
+            Bit number (0-15), or 0 if not a bit address
+        """
+        try:
+            if '.' in plc_address:
+                bit_part = plc_address.split('.')[1]
+                return int(bit_part)
+            return 0
+        except (ValueError, IndexError):
+            return 0
+
+    async def _write_to_csv_async(self, plc_values: dict, plc_cycle_ok: bool):
+        """
+        Write data to CSV file asynchronously.
+        
+        Args:
+            plc_values: Dictionary of OPC UA tag -> PLC value mappings
+            plc_cycle_ok: Whether any PLC read was successful (for HEARTBEAT)
+        """
+        try:
+            # Initialize row data with timestamp
+            row_data = [datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
+            
+            # Process all address mappings in original order for consistent CSV columns
+            for mapping in self.address_mappings:
+                plc_address = mapping['plc_reg_add']
+                opcua_tag = mapping['opcua_reg_add']
+
+                # Handle HEARTBEAT with correct plc_cycle_ok value
+                if plc_address == "HEARTBEAT":
+                    plc_value = plc_cycle_ok
+                else:
+                    plc_value = plc_values.get(opcua_tag, None)
+
+                # Append the value to the row data (maintains column order!)
+                row_data.append(str(plc_value) if plc_value is not None else 'NaN')
+
+            # Write to CSV file if enabled or if OPC UA is down
+            if self.csv_enabled or not self.opcua_connected:
+                await self._ensure_csv_file_async()
+                if self.csv_writer and self.csv_file:
+                    self.csv_writer.writerow(row_data)
+                    self.csv_file.flush()
+                    self.logger.debug(f"CSV data written: {len(row_data)} columns")
+                    
+        except Exception as e:
+            self.logger.error(f"Error writing to CSV: {e}")
+
+    async def _write_to_opcua_async(self, opcua_manager, plc_values: dict, plc_cycle_ok: bool):
+        """
+        Write data to OPC UA server asynchronously.
+        
+        Args:
+            opcua_manager: OPC UA node mapper instance
+            plc_values: Dictionary of OPC UA tag -> PLC value mappings
+            plc_cycle_ok: Whether any PLC read was successful (for HEARTBEAT)
+        """
+        if not self.opcua_connected or opcua_manager is None:
+            return
+            
+        try:
+            # Process all address mappings
+            for mapping in self.address_mappings:
+                plc_address = mapping['plc_reg_add']
+                opcua_tag = mapping['opcua_reg_add']
+
+                # Handle HEARTBEAT with correct plc_cycle_ok value
+                if plc_address == "HEARTBEAT":
+                    plc_value = plc_cycle_ok
+                else:
+                    plc_value = plc_values.get(opcua_tag, None)
+
+                if plc_value is None:
+                    continue  # Skip None values for OPC UA
+
+                # Determine the value to send to OPC UA based on data type
+                opcua_value = plc_value
+                original_data_type = mapping.get('data_type', '').lower()
+
+                if original_data_type == 'bool' and '.' in plc_address:
+                    # Boolean type: Extract bit number and convert to 1/0
+                    bit_number = self._get_bit_number_from_address(plc_address)
+                    opcua_value = self._extract_bit_value_from_hex(str(plc_value), bit_number)
+                    self.logger.debug(f"Boolean conversion: {plc_address} -> HEX:{plc_value} -> Bit {bit_number} -> {opcua_value}")
+                elif original_data_type == 'string':
+                    # String type: Add timestamp using existing function
+                    opcua_value = self._update_plc_value(str(plc_value))
+                    self.logger.debug(f"String with timestamp: {plc_address} -> {opcua_value}")
+
+                # Push value to OPCUA server
+                opcua_manager.write(opcua_tag, opcua_value)
+
+        except Exception as e:
+            # Log any missed data pushes and mark connection as disconnected
+            self.failed_to_push += 1
+            self.opcua_connected = False
+            self.logger.error(f"Missed Pushing {self.failed_to_push}, Error in OPC UA batch write: {e}")
+            self.logger.warning("OPC UA connection lost - switching to CSV fallback mode")
+
     async def _perform_plc_update_cycle(self, fins, opcua_manager):
-        """Perform one cycle of reading from PLC and writing to OPC UA with optimized batch reading."""
-        row_data = [datetime.now().strftime("%Y-%m-%d %H:%M:%S")]  # Timestamp
+        """Perform one cycle of reading from PLC and writing to OPC UA with optimized grouping."""
         plc_cycle_ok = False  # Track if at least one PLC read was successful
         plc_values = {}  # Store values by opcua_tag to maintain order
 
-        # Separate HEARTBEAT from other mappings
-        regular_mappings = [m for m in self.address_mappings if m['plc_reg_add'] != "HEARTBEAT"]
-        heartbeat_mapping = next((m for m in self.address_mappings if m['plc_reg_add'] == "HEARTBEAT"), None)
-
-        # Group consecutive addresses for batch reading
-        consecutive_groups = self._group_consecutive_addresses(regular_mappings)
-
-        # Process consecutive groups with batch_read
-        for group in consecutive_groups:
-            if len(group) == 1:
-                # Single address - use individual read
-                mapping = group[0]
-                plc_address = mapping['plc_reg_add']
-                opcua_tag = mapping['opcua_reg_add']
-                data_type = mapping.get('data_type', 'int16')
-                bool_temp = False
-
-                if data_type == 'bool':
-                    bool_temp = True
-
-                if data_type in ['bool','channel']:
-                    data_type = 'int16'
-
-                try:
-                    pack_value = await fins.read(plc_address, data_type=data_type)
-                    unpack_value = pack_value['data'][0]
-
-                    if unpack_value is not None:
-                        plc_cycle_ok = True
-                        if bool_temp:
-                            plc_value = bool(unpack_value)
+        # Process multiple read groups (1-word data types in batches of 20)
+        for group in self.multiple_read_groups:
+            # Build dictionary for multiple_read
+            memory_codes_dict = {}
+            for item in group:
+                memory_codes_dict[item['plc_reg']] = item['data_type']
+            
+            try:
+                multiple_result = await fins.multiple_read(memory_codes_dict)
+                
+                if multiple_result['status'] == 'success':
+                    plc_cycle_ok = True
+                    for item in group:
+                        plc_address = item['plc_reg']
+                        opcua_tag = item['opcua_reg']
+                        data_type_orig = item['original_mapping'].get('data_type', 'int16')
+                        
+                        """
+                        as the result in the dictinary {key = plc_reg: {data_type,value }}
+                        """
+                        # first checking if the plc_address is present
+                        if plc_address in multiple_result['data']:
+                            item_data = multiple_result['data'][plc_address]
+                            if 'value' in item_data:
+                                raw_bytes = item_data['value']
+                                # Convert bytes to HEX string (0x8080 -> "8080")
+                                if isinstance(raw_bytes, bytes):
+                                    hex_string = self._hex_bytes_to_string(raw_bytes)
+                                    plc_value = hex_string
+                                else:
+                                    plc_value = str(raw_bytes) if raw_bytes is not None else None
+                            else:
+                                plc_value = None
                         else:
-                            plc_value = unpack_value
-                    else:
-                        plc_value = None
-
-                except Exception as e:
-                    plc_value = None
-                    self.failed_to_read += 1
-                    self.logger.error(f"Missed reading {self.failed_to_read},\n Error reading PLC {self.name} address {plc_address}: \n{e}")
-                    if self.failed_to_read > self.threshold:
-                        self.logger.error(f"Too many errors encountered: {self.failed_to_read} reads the threshold met {self.threshold}. Closing task.")
-                        await self.queue.put(f"{self.name}-too many errors")
-                        self.stop()
-                        return
-
-                plc_values[opcua_tag] = plc_value
-
-            else:
-                # Consecutive group - use batch_read
-                first_mapping = group[0]
-                plc_address = first_mapping['plc_reg_add']
-                data_type = first_mapping.get('data_type', 'int16').upper()
-                if data_type in ['BOOL', 'CHANNEL']:
-                    data_type = 'INT16'
-
-                try:
-                    batch_result = await fins.batch_read(plc_address, data_type=data_type, no_items_to_read=len(group))
-
-                    if batch_result['status'] == 'success':
-                        plc_cycle_ok = True
-                        for i, mapping in enumerate(group):
-                            opcua_tag = mapping['opcua_reg_add']
-                            data_type_orig = mapping.get('data_type', 'int16')
-                            bool_temp = data_type_orig == 'bool'
-
-                            unpack_value = batch_result['data'][i] if i < len(batch_result['data']) else None
-
-                            if unpack_value is not None:
-                                if bool_temp:
-                                    plc_value = bool(unpack_value)
-                                else:
-                                    plc_value = unpack_value
-                            else:
-                                plc_value = None
-
-                            plc_values[opcua_tag] = plc_value
-                    else:
-                        # Batch read failed, fall back to individual reads
-                        self.logger.warning(f"Batch read failed for group starting at {plc_address}, falling back to individual reads")
-                        for mapping in group:
-                            plc_address_ind = mapping['plc_reg_add']
-                            opcua_tag = mapping['opcua_reg_add']
-                            data_type_ind = mapping.get('data_type', 'int16')
-                            bool_temp = data_type_ind == 'bool'
-
-                            if data_type_ind in ['bool','channel']:
-                                data_type_ind = 'int16'
-
-                            try:
-                                pack_value = await fins.read(plc_address_ind, data_type=data_type_ind)
-                                unpack_value = pack_value['data'][0]
-
-                                if unpack_value is not None:
-                                    plc_cycle_ok = True
-                                    if bool_temp:
-                                        plc_value = bool(unpack_value)
-                                    else:
-                                        plc_value = unpack_value
-                                else:
-                                    plc_value = None
-
-                            except Exception as e:
-                                plc_value = None
-                                self.failed_to_read += 1
-                                self.logger.error(f"Missed reading {self.failed_to_read},\n Error reading PLC {self.name} address {plc_address_ind}: \n{e}")
-                                if self.failed_to_read > self.threshold:
-                                    self.logger.error(f"Too many errors encountered: {self.failed_to_read} reads the threshold met {self.threshold}. Closing task.")
-                                    await self.queue.put(f"{self.name}-too many errors")
-                                    self.stop()
-                                    return
-
-                            plc_values[opcua_tag] = plc_value
-
-                except Exception as e:
-                    # Batch read exception, fall back to individual reads
-                    self.logger.warning(f"Batch read exception for group starting at {plc_address}: {e}, falling back to individual reads")
-                    for mapping in group:
-                        plc_address_ind = mapping['plc_reg_add']
-                        opcua_tag = mapping['opcua_reg_add']
-                        data_type_ind = mapping.get('data_type', 'int16')
-                        bool_temp = data_type_ind == 'bool'
-
-                        if data_type_ind in ['bool','channel']:
-                            data_type_ind = 'int16'
-
-                        try:
-                            pack_value = await fins.read(plc_address_ind, data_type=data_type_ind)
-                            unpack_value = pack_value['data'][0]
-
-                            if unpack_value is not None:
-                                plc_cycle_ok = True
-                                if bool_temp:
-                                    plc_value = bool(unpack_value)
-                                else:
-                                    plc_value = unpack_value
-                            else:
-                                plc_value = None
-
-                        except Exception as e2:
                             plc_value = None
-                            self.failed_to_read += 1
-                            self.logger.error(f"Missed reading {self.failed_to_read},\n Error reading PLC {self.name} address {plc_address_ind}: \n{e2}")
-                            if self.failed_to_read > self.threshold:
-                                self.logger.error(f"Too many errors encountered: {self.failed_to_read} reads the threshold met {self.threshold}. Closing task.")
-                                await self.queue.put(f"{self.name}-too many errors")
-                                self.stop()
-                                return
-
+                        
                         plc_values[opcua_tag] = plc_value
+                else:
+                    # Multiple read failed, fall back to individual reads for this group
+                    self.logger.warning(f"Multiple read failed for group: {multiple_result['message']}, falling back to individual reads")
+                    for item in group:
+                        read_success = await self._single_read_fallback(fins, item, plc_values)
+                        if read_success:
+                            plc_cycle_ok = True
+                        
+            except Exception as e:
+                self.logger.error(f"Multiple read exception: {e}, falling back to individual reads")
+                for item in group:
+                    read_success = await self._single_read_fallback(fins, item, plc_values)
+                    if read_success:
+                        plc_cycle_ok = True
+
+        # Process single read addresses (multi-word data types)
+        for item in self.single_read_addresses:
+            read_success = await self._single_read_fallback(fins, item, plc_values)
+            if read_success:
+                plc_cycle_ok = True
+            
+        # HYBRID WRITING PHASE: Parallel CSV and OPC UA writing with background task tracking
         
-        # PASS 2: Write to CSV and OPC UA in original mapping order
-        for mapping in self.address_mappings:
-            plc_address = mapping['plc_reg_add']
-            opcua_tag = mapping['opcua_reg_add']
-
-            # Handle HEARTBEAT with correct plc_cycle_ok value
-            if plc_address == "HEARTBEAT":
-                plc_value = plc_cycle_ok  # Now correctly reflects if any PLC read succeeded
+        # Wait for previous cycle's writing tasks to complete (if any)
+        if self.background_tasks:
+            try:
+                await asyncio.gather(*self.background_tasks, return_exceptions=True)
+                self.logger.debug(f"Completed {len(self.background_tasks)} background writing tasks from previous cycle")
+            except Exception as e:
+                self.logger.warning(f"Error waiting for background tasks: {e}")
+            finally:
+                self.background_tasks.clear()
+        
+        # Create parallel writing tasks for current cycle
+        csv_task = asyncio.create_task(self._write_to_csv_async(plc_values, plc_cycle_ok))
+        csv_task.set_name(f"{self.name}_csv_write")
+        
+        opcua_task = asyncio.create_task(self._write_to_opcua_async(opcua_manager, plc_values, plc_cycle_ok))
+        opcua_task.set_name(f"{self.name}_opcua_write")
+        
+        # Add tasks to background set for next cycle to wait on
+        self.background_tasks.add(csv_task)
+        self.background_tasks.add(opcua_task)
+        
+        self.logger.debug(f"Started parallel writing tasks: CSV and OPC UA for {len(plc_values)} values")
+        
+        # Note: Tasks run in background - next read cycle can start immediately
+            
+    async def _single_read_fallback(self, fins, item, plc_values):
+        """Helper method for single address reads with error handling."""
+        plc_address = item['plc_reg']
+        opcua_tag = item['opcua_reg']
+        data_type = item['data_type']
+        original_mapping = item['original_mapping']
+        data_type_orig = original_mapping.get('data_type', 'int16')
+        bool_temp = data_type_orig.lower() == 'bool'
+        read_success = False
+        
+        try:
+            pack_value = await fins.read(plc_address, data_type=data_type)
+            
+            if pack_value['status'] == 'success' and pack_value['data']:
+                read_success = True
+                raw_bytes = pack_value['data']
+                # Convert bytes to HEX string (0x8080 -> "8080")
+                if isinstance(raw_bytes, bytes):
+                    hex_string = self._hex_bytes_to_string(raw_bytes)
+                    plc_value = hex_string
+                elif isinstance(raw_bytes, list) and len(raw_bytes) > 0:
+                    if isinstance(raw_bytes[0], bytes):
+                        hex_string = self._hex_bytes_to_string(raw_bytes[0])
+                        plc_value = hex_string
+                    else:
+                        plc_value = str(raw_bytes[0]) if raw_bytes[0] is not None else None
+                else:
+                    plc_value = str(raw_bytes) if raw_bytes is not None else None
             else:
-                plc_value = plc_values.get(opcua_tag, None)
+                plc_value = None
 
-            # Append the value to the row data (maintains column order!)
-            row_data.append(str(plc_value) if plc_value is not None else 'NaN')
+        except Exception as e:
+            plc_value = None
+            self.failed_to_read += 1
+            self.logger.error(f"Missed reading {self.failed_to_read},\n Error reading PLC {self.name} address {plc_address}: \n{e}")
+            if self.failed_to_read > self.threshold:
+                self.logger.error(f"Too many errors encountered: {self.failed_to_read} reads the threshold met {self.threshold}. Closing task.")
+                await self.queue.put(f"{self.name}-too many errors")
+                self.stop()
+                return False
 
-            # Writing to the OPCUA server (only if connected and manager is available)
-            if self.opcua_connected and opcua_manager is not None:
-                try:
-                    # Push value to OPCUA server
-                    opcua_manager.write(opcua_tag, plc_value)
-                except Exception as e:
-                    # in the continuous pushing any missed data reason is logged
-                    self.failed_to_push += 1
-                    self.opcua_connected = False  # Mark as disconnected on error
-                    self.logger.error(f"Missed Pushing {self.failed_to_push},\n Error pushing value to OPCUA server {opcua_tag}: {e}")
-                    self.logger.warning("OPC UA connection lost - switching to CSV fallback mode")
-                    continue
-
-        # Write to CSV file if enabled or if OPC UA is down
-        if self.csv_enabled or not self.opcua_connected:
-            await self._ensure_csv_file_async()
-            if self.csv_writer and self.csv_file:
-                # For high-frequency writes, we'll use synchronous CSV writing
-                # as it's typically fast and doesn't benefit much from async
-                self.csv_writer.writerow(row_data)
-                self.csv_file.flush()
+        # Store the read value in plc_values dictionary
+        plc_values[opcua_tag] = plc_value
+        return read_success
     
     async def run(self):
         # Header for the connection status check
@@ -487,10 +574,11 @@ class PLCTask:
         
         
         # Just intemediate step toprint the csv file details 
-        print("\n")
-        print("   ****CSV FILE DETAILS****")
-        print(f"    ✅ CSV File Name - {self.csv_filename}")
-            
+        if self.csv_enabled:
+            print("\n")
+            print("   ****CSV FILE DETAILS****")
+            print(f"    ✅ CSV File Name - {self.csv_filename}")
+                
     
         # Step4: two tasks {get the variable values from the PLC , push value to OPC UA}
         self.logger.info(f"PLC {self.name} running in continuous mode")

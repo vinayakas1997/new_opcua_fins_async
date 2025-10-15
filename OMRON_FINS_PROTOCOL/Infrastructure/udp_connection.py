@@ -693,6 +693,7 @@ class FinsUdpConnection(FinsConnection):
     ) -> Dict[str, Any]:
         """
         Read from multiple non-consecutive memory areas using FINS MULTIPLE_MEMORY_AREA_READ command.
+        Updated to follow test_code.py logic and return raw bytes.
 
         Args:
             dict_memory_codes: Dictionary with memory codes as keys and data types as values
@@ -722,34 +723,45 @@ class FinsUdpConnection(FinsConnection):
         command_code = self.command_codes.MULTIPLE_MEMORY_AREA_READ
         sid = service_id.to_bytes(1, 'big')
 
-        # Construct the data part: number of items + item specifications
-        num_items = len(dict_memory_codes)
-        data_part = num_items.to_bytes(2, 'big')  # Number of memory areas to read
+        # Build data part following test_code.py logic
+        addresses = list(dict_memory_codes.keys())
+        data_part = bytearray()
 
-        item_list = list(dict_memory_codes.items())
-        for memory_code, data_type in item_list:
+        if self.debug:
+            self.logger.debug(f"Building MULTIPLE_MEMORY_AREA_READ command (0x0104) for {len(addresses)} addresses")
+
+        for address in addresses:
             # Validate address
-            validate_address(memory_code)
+            validate_address(address)
 
             # Parse each memory address
             try:
-                info = self.address_parser.parse(memory_code)
+                addr_info = self.address_parser.parse(address)
             except Exception as e:
-                raise FinsAddressError(f"Failed to parse memory address '{memory_code}': {e}") from e
+                raise FinsAddressError(f"Failed to parse memory address '{address}': {e}") from e
 
-            data_part += info['memory_type_code']  # Memory area code
-            data_part += bytes(info['offset_bytes'])  # Beginning address (2 bytes)
-            if info['address_type'] == 'bit':
-                data_part += info['bit_number'].to_bytes(1, 'big')  # Bit number
-            else:
-                data_part += b'\x00'  # No bit number for word addresses
+            if self.debug:
+                self.logger.debug(f"Address {address}: Memory Type Code=0x{addr_info['memory_type_code']:02X}, "
+                                f"Word Address={addr_info['word_address']}, Offset={addr_info['offset_bytes']}")
 
-        # Build FINS command frame
+            # Build 4-byte structure for each address (following test_code.py format):
+            # Byte 1: Memory area code
+            # Bytes 2-3: Address (2 bytes)
+            # Byte 4: Bit position (0x00 for word access)
+            area_data = bytearray(4)
+            area_data[0] = addr_info['memory_type_code']      # Area code (1 byte)
+            area_data[1:3] = bytes(addr_info['offset_bytes']) # Address (2 bytes)
+            area_data[3] = 0x00                               # Bit position (1 byte)
+            
+            data_part += area_data
+
+        # Build FINS command frame (no number of items prefix needed - test_code.py format)
         command_frame = self.fins_command_frame(command_code=command_code, service_id=sid, text=data_part)
         final_result["debug"]["command_frame"] = str(command_frame)
 
         if self.debug:
-            self.logger.debug(f"Sent Multiple Memory Area Read command: {command_frame}")
+            self.logger.debug(f"Sent Multiple Memory Area Read command: {command_frame.hex()}")
+            self.logger.debug(f"Data part ({len(data_part)} bytes): {data_part.hex()}")
             self.logger.debug(f"Destination: {self.addr}")
 
         try:
@@ -758,7 +770,7 @@ class FinsUdpConnection(FinsConnection):
             final_result["debug"]["raw_response_bytes"] = str(response_data)
 
             if self.debug:
-                self.logger.debug(f"Received response: {response_data}")
+                self.logger.debug(f"Received response: {response_data.hex()}")
 
             # Parse the response data
             response_frame = self._parse_response(response_data)
@@ -773,34 +785,36 @@ class FinsUdpConnection(FinsConnection):
                 self.logger.debug(f"Response status: {msg}")
 
             if is_success:
-                # Parse the response data: data from each memory area in sequence
-                data_index = 0
+                # Parse response data following test_code.py logic: each address takes 3 bytes: 1 status + 2 data
+                raw_data = response_frame.text
                 updated_dict = {}
-                for memory_code, data_type in item_list:
-                    # Get conversion function and word_size per item from mapping
-                    words_per_item, conversion_function = self._validate_data_type(data_type)
-                    bytes_per_item = words_per_item * 2
 
-                    # Extract bytes for this item
-                    item_bytes = response_frame.text[data_index:data_index + bytes_per_item]
-                    if len(item_bytes) < bytes_per_item:
-                        updated_dict[memory_code] = {"error": "Insufficient data in response"}
+                if self.debug:
+                    self.logger.debug(f"Response data ({len(raw_data)} bytes): {raw_data.hex()}")
+
+                for i, (memory_code, data_type) in enumerate(dict_memory_codes.items()):
+                    start_idx = i * 3  # Each address takes 3 bytes: 1 status + 2 data
+
+                    if start_idx + 2 < len(raw_data):
+                        # Extract status byte and data bytes
+                        status_byte = raw_data[start_idx:start_idx + 1]
+                        value_bytes = raw_data[start_idx + 1:start_idx + 3]  # Skip status byte, get 2 data bytes
+
+                        if self.debug:
+                            self.logger.debug(f"Address {memory_code}: status={status_byte.hex()}, data={value_bytes.hex()}")
+
+                        updated_dict[memory_code] = {
+                            "type": data_type,
+                            "value": value_bytes,  # Return raw bytes directly
+                            "status_byte": status_byte.hex().upper()
+                        }
                     else:
-                        try:
-                            converted_value = conversion_function(item_bytes)
-                            updated_dict[memory_code] = {
-                                "type": data_type,
-                                "value": converted_value
-                            }
-                        except Exception as e:
-                            updated_dict[memory_code] = {"error": f"Conversion failed: {e}"}
-
-                    data_index += bytes_per_item
+                        updated_dict[memory_code] = {"error": "Insufficient data in response"}
 
                 final_result["status"] = "success"
                 final_result["message"] = "Multiple Memory Area Read Successful"
                 final_result["data"] = updated_dict
-                final_result["meta"]["num_items"] = num_items
+                final_result["meta"]["num_items"] = len(addresses)
             else:
                 final_result["status"] = "error"
                 final_result["message"] = msg
